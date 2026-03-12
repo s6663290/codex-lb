@@ -48,7 +48,7 @@ COPY --from=frontend-build /app/app/static app/static
 
 RUN chmod +x /app/scripts/docker-entrypoint.sh
 
-USER app
+#USER app
 EXPOSE 2455 1455
 
 CMD ["/app/scripts/docker-entrypoint.sh"]
