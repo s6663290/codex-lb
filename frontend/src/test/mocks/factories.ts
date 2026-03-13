@@ -193,6 +193,7 @@ export function createRequestLogEntry(overrides: Partial<RequestLogEntry> = {}):
     apiKeyName: "Primary Key",
     requestId: "req_1",
     model: "gpt-5.1",
+    transport: "http",
     serviceTier: null,
     status: "ok",
     errorCode: null,
@@ -276,6 +277,7 @@ export function createDashboardAuthSession(
 export function createDashboardSettings(overrides: Partial<DashboardSettings> = {}): DashboardSettings {
   return DashboardSettingsSchema.parse({
     stickyThreadsEnabled: true,
+    upstreamStreamTransport: "default",
     preferEarlierResetAccounts: false,
     routingStrategy: "usage_weighted",
     openaiCacheAffinityMaxAgeSeconds: 300,

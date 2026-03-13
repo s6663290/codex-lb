@@ -53,11 +53,13 @@ class Settings(BaseSettings):
     database_sqlite_startup_check_mode: Literal["quick", "full", "off"] = "quick"
     database_alembic_auto_remap_enabled: bool = True
     upstream_base_url: str = "https://chatgpt.com/backend-api"
+    upstream_stream_transport: Literal["http", "websocket", "auto"] = "auto"
     upstream_connect_timeout_seconds: float = 8.0
     upstream_compact_timeout_seconds: float | None = None
-    proxy_request_budget_seconds: float = Field(default=75.0, gt=0)
+    upstream_websocket_trust_env: bool = False
+    proxy_request_budget_seconds: float = Field(default=600.0, gt=0)
     compact_request_budget_seconds: float = Field(default=75.0, gt=0)
-    stream_idle_timeout_seconds: float = 45.0
+    stream_idle_timeout_seconds: float = 300.0
     max_sse_event_bytes: int = Field(default=2 * 1024 * 1024, gt=0)
     auth_base_url: str = "https://auth.openai.com"
     oauth_client_id: str = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -74,6 +76,7 @@ class Settings(BaseSettings):
     usage_refresh_enabled: bool = True
     usage_refresh_interval_seconds: int = Field(default=60, gt=0)
     openai_cache_affinity_max_age_seconds: int = Field(default=300, gt=0)
+    sticky_session_cleanup_enabled: bool = True
     sticky_session_cleanup_interval_seconds: int = Field(default=300, gt=0)
     encryption_key_file: Path = DEFAULT_ENCRYPTION_KEY_FILE
     database_migrations_fail_fast: bool = True

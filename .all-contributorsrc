@@ -193,6 +193,25 @@
         "bug",
         "test"
       ]
+    },
+    {
+      "login": "huzky-v",
+      "name": "Jacky Fong",
+      "avatar_url": "https://avatars.githubusercontent.com/u/194083329?v=4",
+      "profile": "https://linktree.huzky.dev/",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "flokosti96",
+      "name": "flokosti96",
+      "avatar_url": "https://avatars.githubusercontent.com/u/144428350?v=4",
+      "profile": "https://github.com/flokosti96",
+      "contributions": [
+        "code",
+        "test"
+      ]
     }
   ],
   "contributorsPerLine": 7,

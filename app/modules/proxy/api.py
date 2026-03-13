@@ -5,7 +5,7 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from typing import cast
 
-from fastapi import APIRouter, Body, Depends, File, Form, Request, Response, Security, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Request, Response, Security, UploadFile, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
@@ -13,15 +13,19 @@ from app.core.auth.dependencies import (
     set_openai_error_format,
     validate_codex_usage_identity,
     validate_proxy_api_key,
+    validate_proxy_api_key_authorization,
 )
 from app.core.clients.proxy import ProxyResponseError
+from app.core.config.settings import get_settings
 from app.core.errors import OpenAIErrorEnvelope, openai_error
-from app.core.exceptions import ProxyAuthError, ProxyModelNotAllowed, ProxyRateLimitError
+from app.core.exceptions import ProxyAuthError, ProxyRateLimitError
+from app.core.middleware.api_firewall import _parse_trusted_proxy_networks, resolve_connection_client_ip
 from app.core.openai.chat_requests import ChatCompletionsRequest
 from app.core.openai.chat_responses import ChatCompletionResult, collect_chat_completion, stream_chat_chunks
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.model_registry import UpstreamModel, get_model_registry, is_public_model
 from app.core.openai.models import (
+    CompactResponseResult,
     OpenAIError,
     OpenAIResponsePayload,
     OpenAIResponseResult,
@@ -30,15 +34,14 @@ from app.core.openai.models import (
     OpenAIErrorEnvelope as OpenAIErrorEnvelopeModel,
 )
 from app.core.openai.parsing import parse_response_payload
-from app.core.openai.requests import ResponsesCompactRequest, ResponsesReasoning, ResponsesRequest
+from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
 from app.core.openai.v1_requests import V1ResponsesCompactRequest, V1ResponsesRequest
 from app.core.runtime_logging import log_error_response
 from app.core.types import JsonValue
 from app.core.utils.json_guards import is_json_mapping
-from app.core.utils.request_id import get_request_id
 from app.core.utils.sse import parse_sse_data_json
 from app.db.session import get_background_session
-from app.dependencies import ProxyContext, get_proxy_context
+from app.dependencies import ProxyContext, get_proxy_context, get_proxy_websocket_context
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import (
     ApiKeyData,
@@ -46,6 +49,14 @@ from app.modules.api_keys.service import (
     ApiKeyRateLimitExceededError,
     ApiKeysService,
     ApiKeyUsageReservationData,
+)
+from app.modules.firewall.repository import FirewallRepository
+from app.modules.firewall.service import FirewallService
+from app.modules.proxy.request_policy import (
+    apply_api_key_enforcement,
+    openai_invalid_payload_error,
+    openai_validation_error,
+    validate_model_access,
 )
 from app.modules.proxy.schemas import (
     ModelListItem,
@@ -62,10 +73,18 @@ router = APIRouter(
     tags=["proxy"],
     dependencies=[Security(validate_proxy_api_key), Depends(set_openai_error_format)],
 )
+ws_router = APIRouter(
+    prefix="/backend-api/codex",
+    tags=["proxy"],
+)
 v1_router = APIRouter(
     prefix="/v1",
     tags=["proxy"],
     dependencies=[Security(validate_proxy_api_key), Depends(set_openai_error_format)],
+)
+v1_ws_router = APIRouter(
+    prefix="/v1",
+    tags=["proxy"],
 )
 usage_router = APIRouter(
     tags=["proxy"],
@@ -107,6 +126,25 @@ async def responses(
     return await _stream_responses(request, payload, context, api_key, codex_session_affinity=True)
 
 
+@ws_router.websocket("/responses")
+async def responses_websocket(
+    websocket: WebSocket,
+    context: ProxyContext = Depends(get_proxy_websocket_context),
+) -> None:
+    api_key, denial = await _validate_proxy_websocket_request(websocket)
+    if denial is not None:
+        await websocket.send_denial_response(denial)
+        return
+    await websocket.accept()
+    await context.service.proxy_responses_websocket(
+        websocket,
+        websocket.headers,
+        codex_session_affinity=True,
+        openai_cache_affinity=False,
+        api_key=api_key,
+    )
+
+
 @v1_router.post(
     "/responses",
     response_model=OpenAIResponseResult,
@@ -129,10 +167,10 @@ async def v1_responses(
     try:
         responses_payload = payload.to_responses_request()
     except ClientPayloadError as exc:
-        error = _openai_invalid_payload_error(exc.param)
+        error = openai_invalid_payload_error(exc.param)
         return _logged_error_json_response(request, 400, error)
     except ValidationError as exc:
-        error = _openai_validation_error(exc)
+        error = openai_validation_error(exc)
         return _logged_error_json_response(request, 400, error)
     if responses_payload.stream:
         return await _stream_responses(
@@ -148,6 +186,25 @@ async def v1_responses(
         context,
         api_key,
         openai_cache_affinity=True,
+    )
+
+
+@v1_ws_router.websocket("/responses")
+async def v1_responses_websocket(
+    websocket: WebSocket,
+    context: ProxyContext = Depends(get_proxy_websocket_context),
+) -> None:
+    api_key, denial = await _validate_proxy_websocket_request(websocket)
+    if denial is not None:
+        await websocket.send_denial_response(denial)
+        return
+    await websocket.accept()
+    await context.service.proxy_responses_websocket(
+        websocket,
+        websocket.headers,
+        codex_session_affinity=False,
+        openai_cache_affinity=True,
+        api_key=api_key,
     )
 
 
@@ -284,16 +341,16 @@ async def v1_chat_completions(
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> Response:
     effective_model = _effective_model_for_api_key(api_key, payload.model)
-    _validate_model_access(api_key, effective_model)
+    validate_model_access(api_key, effective_model)
 
     rate_limit_headers = await context.service.rate_limit_headers()
     try:
         responses_payload = payload.to_responses_request()
     except ClientPayloadError as exc:
-        error = _openai_invalid_payload_error(exc.param)
+        error = openai_invalid_payload_error(exc.param)
         return _logged_error_json_response(request, 400, error, headers=rate_limit_headers)
     except ValidationError as exc:
-        error = _openai_validation_error(exc)
+        error = openai_validation_error(exc)
         return _logged_error_json_response(request, 400, error, headers=rate_limit_headers)
     reservation = await _enforce_request_limits(
         api_key,
@@ -301,7 +358,7 @@ async def v1_chat_completions(
         request_service_tier=responses_payload.service_tier,
     )
     responses_payload.stream = True
-    _apply_api_key_enforcement(responses_payload, api_key)
+    apply_api_key_enforcement(responses_payload, api_key)
     stream = context.service.stream_responses(
         responses_payload,
         request.headers,
@@ -356,8 +413,8 @@ async def _stream_responses(
     openai_cache_affinity: bool = False,
     suppress_text_done_events: bool = False,
 ) -> Response:
-    _apply_api_key_enforcement(payload, api_key)
-    _validate_model_access(api_key, payload.model)
+    apply_api_key_enforcement(payload, api_key)
+    validate_model_access(api_key, payload.model)
     reservation = await _enforce_request_limits(
         api_key,
         request_model=payload.model,
@@ -404,8 +461,8 @@ async def _collect_responses(
     openai_cache_affinity: bool = False,
     suppress_text_done_events: bool = False,
 ) -> Response:
-    _apply_api_key_enforcement(payload, api_key)
-    _validate_model_access(api_key, payload.model)
+    apply_api_key_enforcement(payload, api_key)
+    validate_model_access(api_key, payload.model)
     reservation = await _enforce_request_limits(
         api_key,
         request_model=payload.model,
@@ -458,7 +515,7 @@ async def _collect_responses(
     )
 
 
-@router.post("/responses/compact", response_model=OpenAIResponseResult)
+@router.post("/responses/compact", response_model=CompactResponseResult)
 async def responses_compact(
     request: Request,
     payload: ResponsesCompactRequest = Body(...),
@@ -468,7 +525,7 @@ async def responses_compact(
     return await _compact_responses(request, payload, context, api_key, codex_session_affinity=True)
 
 
-@v1_router.post("/responses/compact", response_model=OpenAIResponseResult)
+@v1_router.post("/responses/compact", response_model=CompactResponseResult)
 async def v1_responses_compact(
     request: Request,
     payload: V1ResponsesCompactRequest = Body(...),
@@ -478,10 +535,10 @@ async def v1_responses_compact(
     try:
         compact_payload = payload.to_compact_request()
     except ClientPayloadError as exc:
-        error = _openai_invalid_payload_error(exc.param)
+        error = openai_invalid_payload_error(exc.param)
         return _logged_error_json_response(request, 400, error)
     except ValidationError as exc:
-        error = _openai_validation_error(exc)
+        error = openai_validation_error(exc)
         return _logged_error_json_response(request, 400, error)
     return await _compact_responses(
         request,
@@ -500,8 +557,8 @@ async def _compact_responses(
     codex_session_affinity: bool = False,
     openai_cache_affinity: bool = False,
 ) -> JSONResponse:
-    _apply_api_key_enforcement(payload, api_key)
-    _validate_model_access(api_key, payload.model)
+    apply_api_key_enforcement(payload, api_key)
+    validate_model_access(api_key, payload.model)
     reservation = await _enforce_request_limits(
         api_key,
         request_model=payload.model,
@@ -556,7 +613,7 @@ async def _transcribe_request(
     context: ProxyContext,
     api_key: ApiKeyData | None,
 ) -> JSONResponse:
-    _validate_model_access(api_key, _TRANSCRIPTION_MODEL)
+    validate_model_access(api_key, _TRANSCRIPTION_MODEL)
     reservation = await _enforce_request_limits(
         api_key,
         request_model=_TRANSCRIPTION_MODEL,
@@ -644,6 +701,40 @@ def _error_details_from_content(
     return code if isinstance(code, str) else None, message if isinstance(message, str) else None
 
 
+async def _validate_proxy_websocket_request(
+    websocket: WebSocket,
+) -> tuple[ApiKeyData | None, JSONResponse | None]:
+    denial = await _websocket_firewall_denial_response(websocket)
+    if denial is not None:
+        return None, denial
+    try:
+        api_key = await validate_proxy_api_key_authorization(websocket.headers.get("authorization"))
+    except ProxyAuthError as exc:
+        return None, JSONResponse(
+            status_code=exc.status_code,
+            content=openai_error(exc.code, exc.message, error_type=exc.error_type),
+        )
+    return api_key, None
+
+
+async def _websocket_firewall_denial_response(websocket: WebSocket) -> JSONResponse | None:
+    settings = get_settings()
+    client_ip = resolve_connection_client_ip(
+        websocket.headers,
+        websocket.client.host if websocket.client else None,
+        trust_proxy_headers=settings.firewall_trust_proxy_headers,
+        trusted_proxy_networks=_parse_trusted_proxy_networks(settings.firewall_trusted_proxy_cidrs),
+    )
+    async with get_background_session() as session:
+        service = FirewallService(FirewallRepository(session))
+        if await service.is_ip_allowed(client_ip):
+            return None
+    return JSONResponse(
+        status_code=403,
+        content=openai_error("ip_forbidden", "Access denied for client IP", error_type="access_error"),
+    )
+
+
 async def _enforce_request_limits(
     api_key: ApiKeyData | None,
     *,
@@ -674,50 +765,6 @@ async def _release_reservation(reservation: ApiKeyUsageReservationData | None) -
     async with get_background_session() as session:
         service = ApiKeysService(ApiKeysRepository(session))
         await service.release_usage_reservation(reservation.reservation_id)
-
-
-def _validate_model_access(api_key: ApiKeyData | None, model: str | None) -> None:
-    if api_key is None:
-        return
-    allowed_models = api_key.allowed_models
-    if not allowed_models:
-        return
-    if model is None or model in allowed_models:
-        return
-    raise ProxyModelNotAllowed(f"This API key does not have access to model '{model}'")
-
-
-def _apply_api_key_enforcement(
-    payload: ResponsesRequest | ResponsesCompactRequest,
-    api_key: ApiKeyData | None,
-) -> None:
-    if api_key is None:
-        return
-
-    if api_key.enforced_model and payload.model != api_key.enforced_model:
-        logger.info(
-            "api_key_model_enforced request_id=%s key_id=%s requested_model=%s enforced_model=%s",
-            get_request_id(),
-            api_key.id,
-            payload.model,
-            api_key.enforced_model,
-        )
-        payload.model = api_key.enforced_model
-
-    if api_key.enforced_reasoning_effort is not None:
-        requested_effort = payload.reasoning.effort if payload.reasoning else None
-        if payload.reasoning is None:
-            payload.reasoning = ResponsesReasoning(effort=api_key.enforced_reasoning_effort)
-        else:
-            payload.reasoning.effort = api_key.enforced_reasoning_effort
-        if requested_effort != api_key.enforced_reasoning_effort:
-            logger.info(
-                "api_key_reasoning_enforced request_id=%s key_id=%s requested_effort=%s enforced_effort=%s",
-                get_request_id(),
-                api_key.id,
-                requested_effort,
-                api_key.enforced_reasoning_effort,
-            )
 
 
 def _effective_model_for_api_key(api_key: ApiKeyData | None, requested_model: str) -> str:
@@ -838,25 +885,6 @@ def _parse_error_envelope(payload: JsonValue | OpenAIErrorEnvelope) -> OpenAIErr
         return OpenAIErrorEnvelopeModel.model_validate(payload)
     except ValidationError:
         return _default_error_envelope()
-
-
-def _openai_validation_error(exc: ValidationError) -> OpenAIErrorEnvelope:
-    error = _openai_invalid_payload_error()
-    if exc.errors():
-        first = exc.errors()[0]
-        loc = first.get("loc", [])
-        if isinstance(loc, (list, tuple)):
-            param = ".".join(str(part) for part in loc if part != "body")
-            if param:
-                error["error"]["param"] = param
-    return error
-
-
-def _openai_invalid_payload_error(param: str | None = None) -> OpenAIErrorEnvelope:
-    error = openai_error("invalid_request_error", "Invalid request payload", error_type="invalid_request_error")
-    if param:
-        error["error"]["param"] = param
-    return error
 
 
 def _openai_invalid_transcription_model_error(model: str) -> OpenAIErrorEnvelope:

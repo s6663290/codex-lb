@@ -116,6 +116,7 @@ class RequestLog(Base):
     request_id: Mapped[str] = mapped_column(String, nullable=False)
     requested_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     model: Mapped[str] = mapped_column(String, nullable=False)
+    transport: Mapped[str | None] = mapped_column(String, nullable=True)
     service_tier: Mapped[str | None] = mapped_column(String, nullable=True)
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -159,6 +160,12 @@ class DashboardSettings(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
     sticky_threads_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    upstream_stream_transport: Mapped[str] = mapped_column(
+        String,
+        default="default",
+        server_default=text("'default'"),
+        nullable=False,
+    )
     prefer_earlier_reset_accounts: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     routing_strategy: Mapped[str] = mapped_column(
         String,
